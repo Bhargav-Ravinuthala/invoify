@@ -1,120 +1,95 @@
 import { NextRequest, NextResponse } from "next/server";
-
-// Chromium
-import chromium from "@sparticuz/chromium";
-
-// Helpers
-import { getInvoiceTemplate } from "@/lib/helpers";
-
-// Variables
-import { CHROMIUM_EXECUTABLE_PATH, ENV, TAILWIND_CDN } from "@/lib/variables";
-
-// Types
+import puppeteer from "puppeteer";
 import { InvoiceType } from "@/types";
 
-/**
- * Generate a PDF document of an invoice based on the provided data.
- *
- * @async
- * @param {NextRequest} req - The Next.js request object.
- * @throws {Error} If there is an error during the PDF generation process.
- * @returns {Promise<NextResponse>} A promise that resolves to a NextResponse object containing the generated PDF.
- */
+// Generate PDF service
 export async function generatePdfService(req: NextRequest) {
-    const body: InvoiceType = await req.json();
-
-    // Create a browser instance
-    let browser;
-
     try {
-        const ReactDOMServer = (await import("react-dom/server")).default;
+        const data: InvoiceType = await req.json();
 
-        // Get the selected invoice template
-        const templateId = body.details.pdfTemplate;
-        const InvoiceTemplate = await getInvoiceTemplate(templateId);
+        // Launch puppeteer with explicit configuration
+        const browser = await puppeteer.launch({
+            executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || "/usr/bin/chromium-browser",
+            headless: "new",
+            args: [
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-dev-shm-usage',
+                '--disable-accelerated-2d-canvas',
+                '--no-first-run',
+                '--no-zygote',
+                '--single-process',
+                '--disable-gpu',
+                '--disable-features=site-per-process',
+                '--user-data-dir=/tmp/chromium-data-dir'
+            ],
+            ignoreHTTPSErrors: true
+        });
 
-        // Read the HTML template from a React component
-        const htmlTemplate = ReactDOMServer.renderToStaticMarkup(
-            InvoiceTemplate(body)
-        );
+        try {
+            // Create a new page
+            const page = await browser.newPage();
+            
+            // Set HTML content based on template
+            let htmlContent = '';
 
-        // Launch the browser in production or development mode depending on the environment
-        if (ENV === "production") {
-            const puppeteer = await import("puppeteer-core");
-            browser = await puppeteer.launch({
-                args: chromium.args,
-                defaultViewport: chromium.defaultViewport,
-                executablePath: await chromium.executablePath(
-                    CHROMIUM_EXECUTABLE_PATH
-                ),
-                headless: true,
-                ignoreHTTPSErrors: true,
+            // Determine which template to render
+            const templateNumber = data.details.pdfTemplate;
+            
+            // Get the hostname to build the URL for fetching the template
+            const host = req.headers.get('host') || 'localhost:3000';
+            const protocol = host.includes('localhost') ? 'http' : 'https';
+            
+            // Get locale from the data or default to 'en'
+            const locale = data.locale || 'en';
+            
+            // Build the URL for the template
+            const url = `${protocol}://${host}/${locale}/template/${templateNumber}`;
+            
+            // Navigate to the template URL with a query string containing the invoice data
+            await page.goto(url, { waitUntil: 'networkidle0' });
+            
+            // Execute script to hydrate the page with invoice data
+            await page.evaluate((invoiceData) => {
+                // This assumes there's a global function or event listener in your template page
+                // that can receive and process this data
+                window.postMessage({ type: 'INVOICE_DATA', data: invoiceData }, '*');
+            }, data);
+            
+            // Wait for any post-processing
+            await page.waitForTimeout(1000);
+            
+            // Generate PDF
+            const pdf = await page.pdf({
+                format: 'a4',
+                printBackground: true,
+                margin: {
+                    top: '20px',
+                    right: '20px',
+                    bottom: '20px',
+                    left: '20px'
+                }
             });
-        } else if (ENV === "development") {
-            const puppeteer = await import("puppeteer");
-            browser = await puppeteer.launch({
-                args: ["--no-sandbox", "--disable-setuid-sandbox"],
-                headless: "new",
+            
+            // Return the PDF
+            return new NextResponse(pdf, {
+                status: 200,
+                headers: {
+                    'Content-Type': 'application/pdf',
+                    'Content-Disposition': `attachment; filename=invoice-${data.details.invoiceNumber}.pdf`
+                }
             });
+        } finally {
+            // Ensure browser is closed even if an error occurs
+            await browser.close();
         }
-
-        if (!browser) {
-            throw new Error("Failed to launch browser");
-        }
-
-        const page = await browser.newPage();
-        console.log("Page opened"); // Debugging log
-
-        // Set the HTML content of the page
-        await page.setContent(await htmlTemplate, {
-            // * "waitUntil" prop makes fonts work in templates
-            waitUntil: "networkidle0",
-        });
-        console.log("Page content set"); // Debugging log
-
-        // Add Tailwind CSS
-        await page.addStyleTag({
-            url: TAILWIND_CDN,
-        });
-        console.log("Style tag added"); // Debugging log
-
-        // Generate the PDF
-        const pdf: Buffer = await page.pdf({
-            format: "a4",
-            printBackground: true,
-        });
-        console.log("PDF generated"); // Debugging log
-
-        for (const page of await browser.pages()) {
-            await page.close();
-        }
-
-        // Close the Puppeteer browser
-        await browser.close();
-        console.log("Browser closed"); // Debugging log
-
-        // Create a Blob from the PDF data
-        const pdfBlob = new Blob([pdf], { type: "application/pdf" });
-
-        const response = new NextResponse(pdfBlob, {
-            headers: {
-                "Content-Type": "application/pdf",
-                "Content-Disposition": "inline; filename=invoice.pdf",
-            },
-            status: 200,
-        });
-
-        return response;
     } catch (error) {
-        console.error(error);
-
-        // Return an error response
-        return new NextResponse(`Error generating PDF: \n${error}`, {
+        console.error('PDF Generation Error:', error);
+        return new NextResponse(JSON.stringify({ error: 'Failed to generate PDF' }), {
             status: 500,
+            headers: {
+                'Content-Type': 'application/json'
+            }
         });
-    } finally {
-        if (browser) {
-            await Promise.race([browser.close(), browser.close(), browser.close()]);
-        }
     }
 }
