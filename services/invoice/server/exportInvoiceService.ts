@@ -1,96 +1,126 @@
 import { NextRequest, NextResponse } from "next/server";
+import puppeteer from "puppeteer";
+import { InvoiceType } from "@/types";
 
-// JSON2CSV
-import { AsyncParser } from "@json2csv/node";
-
-// XML2JS
-import { Builder } from "xml2js";
-
-// XLSX
-import XLSX from "xlsx";
-
-// Helpers
-import { flattenObject } from "@/lib/helpers";
-
-// Types
-import { ExportTypes } from "@/types";
-
-/**
- * Export an invoice in selected format.
- *
- * @param {NextRequest} req - The Next.js request object.
- * @returns {NextResponse} A response object containing the exported data in the requested format.
- */
+// Export invoice service
 export async function exportInvoiceService(req: NextRequest) {
-    const body = await req.json();
-    const format = req.nextUrl.searchParams.get("format");
-
     try {
-        switch (format) {
-            case ExportTypes.JSON:
-                const jsonData = JSON.stringify(body);
-                return new NextResponse(jsonData, {
-                    headers: {
-                        "Content-Type": "application/json",
-                        "Content-Disposition":
-                            "attachment; filename=invoice.json",
-                    },
+        const { data, type }: { data: InvoiceType; type: string } = await req.json();
+
+        // For formats that require PDF generation (like PDF to XLSX conversion)
+        if (type === 'pdf' || type === 'pdfXLSX') {
+            // Launch puppeteer with explicit configuration
+            const browser = await puppeteer.launch({
+                executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || "/usr/bin/chromium-browser",
+                headless: "new",
+                args: [
+                    '--no-sandbox',
+                    '--disable-setuid-sandbox',
+                    '--disable-dev-shm-usage',
+                    '--disable-accelerated-2d-canvas',
+                    '--no-first-run',
+                    '--no-zygote',
+                    '--single-process',
+                    '--disable-gpu',
+                    '--disable-features=site-per-process',
+                    '--user-data-dir=/tmp/chromium-data-dir'
+                ],
+                ignoreHTTPSErrors: true
+            });
+
+            try {
+                // Create a new page
+                const page = await browser.newPage();
+                
+                // Get the hostname to build the URL for fetching the template
+                const host = req.headers.get('host') || 'localhost:3000';
+                const protocol = host.includes('localhost') ? 'http' : 'https';
+                
+                // Get locale from the data or default to 'en'
+                const locale = data.locale || 'en';
+                
+                // Determine which template to render
+                const templateNumber = data.details.pdfTemplate;
+                
+                // Build the URL for the template
+                const url = `${protocol}://${host}/${locale}/template/${templateNumber}`;
+                
+                // Navigate to the template URL
+                await page.goto(url, { waitUntil: 'networkidle0' });
+                
+                // Execute script to hydrate the page with invoice data
+                await page.evaluate((invoiceData) => {
+                    // This assumes there's a global function or event listener in your template page
+                    // that can receive and process this data
+                    window.postMessage({ type: 'INVOICE_DATA', data: invoiceData }, '*');
+                }, data);
+                
+                // Wait for any post-processing
+                await page.waitForTimeout(1000);
+                
+                // Generate PDF
+                const pdf = await page.pdf({
+                    format: 'a4',
+                    printBackground: true,
+                    margin: {
+                        top: '20px',
+                        right: '20px',
+                        bottom: '20px',
+                        left: '20px'
+                    }
+                });
+
+                // Process according to the export type
+                if (type === 'pdf') {
+                    return new NextResponse(pdf, {
+                        status: 200,
+                        headers: {
+                            'Content-Type': 'application/pdf',
+                            'Content-Disposition': `attachment; filename=invoice-${data.details.invoiceNumber}.pdf`
+                        }
+                    });
+                } else {
+                    // Handle other PDF-based formats like XLSX conversion
+                    // This would need additional processing libraries
+                    return new NextResponse(JSON.stringify({ error: 'Export format not implemented yet' }), {
+                        status: 501,
+                        headers: {
+                            'Content-Type': 'application/json'
+                        }
+                    });
+                }
+            } finally {
+                // Ensure browser is closed even if an error occurs
+                await browser.close();
+            }
+        } else {
+            // Handle other export formats (JSON, CSV, XML)
+            // Export as JSON
+            if (type === 'json') {
+                return new NextResponse(JSON.stringify(data), {
                     status: 200,
-                });
-            case ExportTypes.CSV:
-                //? Can pass specific fields to async parser. Empty = All
-                const parser = new AsyncParser();
-                const csv = await parser.parse(body).promise();
-                return new NextResponse(csv, {
                     headers: {
-                        "Content-Type": "text/csv",
-                        "Content-Disposition":
-                            "attachment; filename=invoice.csv",
-                    },
+                        'Content-Type': 'application/json',
+                        'Content-Disposition': `attachment; filename=invoice-${data.details.invoiceNumber}.json`
+                    }
                 });
-            case ExportTypes.XML:
-                // Convert JSON to XML
-                const builder = new Builder();
-                const xml = builder.buildObject(body);
-                return new NextResponse(xml, {
-                    headers: {
-                        "Content-Type": "application/xml",
-                        "Content-Disposition":
-                            "attachment; filename=invoice.xml",
-                    },
-                });
-            // case ExportTypes.XLSX:
-            //     const flattenedData = flattenObject(body);
-
-            //     // Create a new worksheet and add the data
-            //     const worksheet = XLSX.utils.json_to_sheet([flattenedData]);
-            //     const workbook = XLSX.utils.book_new();
-            //     XLSX.utils.book_append_sheet(
-            //         workbook,
-            //         worksheet,
-            //         "invoice-worksheet"
-            //     );
-            //     // Generate the XLSX file as a buffer
-            //     const buffer = XLSX.write(workbook, {
-            //         bookType: "xlsx",
-            //         type: "buffer",
-            //     });
-
-            //     return new NextResponse(buffer, {
-            //         headers: {
-            //             "Content-Type":
-            //                 "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            //             "Content-Disposition":
-            //                 "attachment; filename=invoice.xlsx",
-            //         },
-            //     });
+            }
+            
+            // For other formats like CSV, XML, XLSX without PDF conversion
+            return new NextResponse(JSON.stringify({ error: 'Export format not implemented yet' }), {
+                status: 501,
+                headers: {
+                    'Content-Type': 'application/json'
+                }
+            });
         }
     } catch (error) {
-        console.error(error);
-
-        // Return an error response
-        return new Response(`Error exporting: \n${error}`, {
+        console.error('Export Error:', error);
+        return new NextResponse(JSON.stringify({ error: 'Failed to export invoice' }), {
             status: 500,
+            headers: {
+                'Content-Type': 'application/json'
+            }
         });
     }
 }
